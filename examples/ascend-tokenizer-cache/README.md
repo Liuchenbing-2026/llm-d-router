@@ -3,7 +3,7 @@
 | Delivery | Status |
 | --- | --- |
 | Backend startup and offline verification helpers | Implemented and locally checked |
-| llm-d-router runtime/policy changes | None; backend integration example |
+| Native tokenizer data producer | Existing vLLM /render path reused; OFF/ON live acceptance added |
 | End-to-end integration and hardware acceptance | Pending |
 
 ## Component integration
@@ -100,3 +100,61 @@ Public offline checks cover launcher argument preservation, invalid budgets,
 installed-file mismatch and complete-ID comparison failure. These checks do
 not substitute for native Router builds, real backend conformance, cluster
 tests, generation/eviction recovery or P/D acceptance.
+
+## Existing native EPP producer and new live acceptance
+
+The existing `backendType: vllm` token producer calls the model's native
+`/render`, preserves the original wire request and shares exact PromptTokens
+within that request. Use this path for compatible Ascend renderer backends;
+no second Go encoding-result cache is introduced. `estimate` produces an
+estimate and is not an equivalent exact-token backend.
+
+Actual package test command (Go 1.27.2, macOS arm64):
+
+```bash
+go test ./pkg/epp/framework/plugins/requestcontrol/dataproducer/tokenizer -count=1 -json
+```
+
+The final run has 449 passing test entries **including subtests**, zero
+failures, and 10 skipped live/model tests. This is a native Go producer /
+mock transport result, not a running Kubernetes Gateway or NPU acceptance.
+The new `TestTokenizerCacheParityLive` invokes the real producer against
+OFF/ON renderers, checks full IDs and multimodal features, and skips explicitly
+when the required endpoints are absent. To execute it on prepared services:
+
+```bash
+export VLLM_RENDER_TEST_BASELINE_URL=http://127.0.0.1:8000
+export VLLM_RENDER_TEST_URL=http://127.0.0.1:8001
+export VLLM_RENDER_TEST_MODEL=local-model
+export VLLM_RENDER_TEST_ALIAS=local-model
+export VLLM_RENDER_TEST_SERVE=1
+go test ./pkg/epp/framework/plugins/requestcontrol/dataproducer/tokenizer \
+  -run 'TestTokenizerCacheParityLive|TestRenderServingLive' -count=1 -v
+```
+
+Set credentials using the existing live-test environment contract if needed.
+Deployment must point render metadata at the same model/template as the target
+engine. Cache-OFF/ON equivalence does not establish physical KV residency.
+
+## Native render and serving conformance (2026-10-10)
+
+`verify_serving.py` supplements `/tokenize` checks with the actual chat-render
+protocol and, with `--serve`, generation request ingress. It compares complete
+OFF/ON token IDs, repetition, growing conversations, Unicode, tenant salts and
+tools. Serving must return the same `prompt_token_ids` and prompt usage.
+
+```bash
+python3 -m unittest -v test_example.py test_serving.py
+python3 verify_serving.py --baseline http://127.0.0.1:8000 \
+  --cached http://127.0.0.1:8001 --model local-model --rounds 3 --serve \
+  --output render-serving-conformance.json
+```
+
+`BACKEND_API_KEY`, if required, is read from the environment. Never commit it.
+The six harness tests use local HTTP fixture servers, not an inference model.
+The serving command requires prepared OFF/ON backends and is **not executed**
+on NPU in this delivery. Output timing is diagnostic only; the harness does not
+measure generation quality, inference throughput, or full Agent success.
+Generation text hashes are recorded without treating nondeterministic text as
+a tokenizer-equivalence failure. Real workload evaluation must use held-out
+Agent tasks and include retries, failures, complete latency and total cost.

@@ -15,5 +15,6 @@
       "renderers/deepseek_v4.py": "b989ea4b4240df0f5eeb832942d1aaa8e72e56743b45186b1b6145d7e7bbbd3a",
       "renderers/deepseek_v32.py": "538f6b2b2db0e0e013318e7ebca7b46c084b865cc7658c76fd499f9bf5ecd85c"
     }
-  }
+  },
+  "cpu_render_launcher_sha256": "6dd347edbc15e4c49c57f38be0a426b17f5494b64f314faf8bff9c8e9a1c7cf7"
 }

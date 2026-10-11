@@ -4,7 +4,8 @@
 | --- | --- |
 | Backend startup and offline verification helpers | Implemented and locally checked |
 | Native tokenizer data producer | Existing vLLM /render path reused; OFF/ON live acceptance added |
-| End-to-end integration and hardware acceptance | Pending |
+| CPU render / native producer acceptance | Passed in the declared Qwen3 text scope; see 2026-10-11 deployment section |
+| Full runtime and hardware acceptance | Pending |
 
 ## Component integration
 
@@ -266,3 +267,114 @@ go vet ./pkg/epp/framework/plugins/requestcontrol/dataproducer/tokenizer
 ~~~
 
 Parse the first JSON output for `Action=pass` of `TestTokenizerCacheParityLive` and reject `Action=skip` or zero cases; process exit zero alone is insufficient. `VLLM_RENDER_TEST_AUTHORIZATION` carries the prepared backend authorization header when needed; never put secrets in commands/archives. This package check does not exercise full EPP, Sidecar, Coordinator, Gateway or P/D. Repository-wide `make presubmit` remains the broader gate for future code changes.
+
+## CPU render deployment and actual EPP acceptance (2026-10-11)
+
+`launch_cpu_renderer.py` uses the pinned Ascend segment-cache implementation
+with vLLM's standalone CPU render service. Each renderer owns its tokenizer
+cache. The adapter checks the source contract, preserves the native HTTP routes,
+and writes cache statistics on graceful shutdown. It does not load model weights.
+
+The CPU factory supplies the cache budget without initializing AscendConfig.
+This is an explicit adapter against the fixed patch's private functions. An
+engine upgrade requires renewed source-contract and behavior verification.
+The native Ascend plugin and NPU generation require separate acceptance.
+
+| Actual check | Result and scope |
+| --- | --- |
+| Native render OFF/ON | 30 comparisons across five cases; complete IDs equal |
+| Independent HF oracle | Eight text-chat cases, both modes, 16 comparisons; complete IDs equal |
+| Native Go producer | 59 passing entries including parents; zero failures/skips; 54 native protocol variants and three parity cases |
+| Cache activation | OFF: zero instances/lookups; ON: one instance, 1043 hits / 1082 lookups in this synthetic run |
+| Existing vLLM launch CLI | 11 tests passed; 15 existing runtime/deprecation warnings recorded |
+| NPU, generation quality, inference throughput | Not evaluated |
+
+The producer run invokes `Produce` with parsed requests and forwards its native
+render HTTP calls through a test proxy to actual services. It covers chat,
+Anthropic-compatible messages, tools, template controls, aliases, batches and
+truncation. This does not start a Kubernetes Gateway, EPP scheduler or KV scorer.
+The first run rejected six automatic-tool variants because startup omitted the
+tool parser. Its failure log is retained; the configured rerun passes.
+
+### Fixed environment
+
+| Item | Actual value |
+| --- | --- |
+| Image tag | quay.nju.edu.cn/ascend/vllm-omni:v0.30.0 |
+| Registry digest | quay.io/ascend/vllm-omni@sha256:274d65369c912c14cc241f53c9c900d95e844b91652ca604cc71f07a9e1b3aaf |
+| Local image ID | sha256:96c8901953dbe758199d97795279762131b58faadb02fa593289ea01e3e68dbd |
+| vLLM base | ced6857afa0ea7b2e3f0846a62e1394e90f15607; native image binaries reused |
+| vLLM render change | [router/tokenizer-cache-render-20261011](https://github.com/Liuchenbing-2026/vllm/tree/router/tokenizer-cache-render-20261011); entry.py preserves additional_config |
+| Ascend cache source | 4ea839b813fecbd1aba3affa63e3c896e75b123b; loaded directly from its fixed Python file |
+| Python / tokenizer stack | 3.12.13; torch 2.10.0+cpu; transformers 5.14.1; tokenizers 0.22.2 |
+| Model assets | Local Qwen3-8B tokenizer, Qwen2Tokenizer class; weights not loaded |
+| CPU isolation | arm64 Linux; 4 CPU / 12 GiB container limit; no device mappings or privileged access |
+
+The CPU test container removes inherited `torch-npu`, `vllm-ascend`, `triton`
+and `triton-ascend` packages. The original image and the native Ascend build
+container remain unchanged. Use `TORCH_DEVICE_BACKEND_AUTOLOAD=0`,
+`VLLM_TARGET_DEVICE=cpu`, and `VLLM_PLUGINS=''` for this renderer.
+The uv 0.11.6 Linux arm64 archive is fixed by SHA256
+`d5be4bf7015ea000378cb3c3aba53ba81a8673458ace9c7fa25a0be005b74802`.
+Its system-site-packages virtual environment resolves Python 3.12.13.
+
+### Actual service and independent comparison commands
+
+From this example directory, use an environment containing the paired vLLM
+render change and the CPU dependencies above. The tested model is mounted at
+`/models/qwen3-8b`; the fixed Ascend source is mounted at the path below.
+Create the output directory first. Launch each mode in its own terminal:
+
+```bash
+export VLLM_PLUGINS='' TORCH_DEVICE_BACKEND_AUTOLOAD=0 VLLM_TARGET_DEVICE=cpu
+export OMP_NUM_THREADS=1 TOKENIZERS_PARALLELISM=false DO_NOT_TRACK=1
+mkdir -p /work/results
+/work/.venv-render/bin/python launch_cpu_renderer.py \
+  --cache-source /work/source/engine-tokenizer-cache-20261011/vllm_ascend/patch/platform/patch_tokenizer_cache.py \
+  --cache-stats-output /work/results/cpu-render-tools-off-stats.json \
+  launch render /models/qwen3-8b --host 127.0.0.1 --port 18480 \
+  --served-model-name router-qwen3-8b router-qwen3-8b-alias \
+  --dtype float32 --max-model-len 4096 \
+  --additional-config '{"tokenizer_cache_gb":0}' \
+  --disable-uvicorn-access-log --enable-auto-tool-choice --tool-call-parser hermes
+/work/.venv-render/bin/python launch_cpu_renderer.py \
+  --cache-source /work/source/engine-tokenizer-cache-20261011/vllm_ascend/patch/platform/patch_tokenizer_cache.py \
+  --cache-stats-output /work/results/cpu-render-tools-on-stats.json \
+  launch render /models/qwen3-8b --host 127.0.0.1 --port 18481 \
+  --served-model-name router-qwen3-8b router-qwen3-8b-alias \
+  --dtype float32 --max-model-len 4096 \
+  --additional-config '{"tokenizer_cache_gb":1}' \
+  --disable-uvicorn-access-log --enable-auto-tool-choice --tool-call-parser hermes
+/work/.venv-render/bin/python verify_serving.py \
+  --baseline http://127.0.0.1:18480 --cached http://127.0.0.1:18481 \
+  --model router-qwen3-8b --rounds 3 --output /work/results/cpu-native-render-tools.json
+/work/.venv-render/bin/python verify_render_oracle.py \
+  --baseline http://127.0.0.1:18480 --cached http://127.0.0.1:18481 \
+  --model router-qwen3-8b --tokenizer /models/qwen3-8b \
+  --output /work/results/cpu-native-oracle-fixed.json
+```
+
+`verify_render_oracle.py` executes in a separate process without importing the
+cache adapter. It uses the tokenizer's native chat template and retains the
+complete expected and observed IDs. It accepts the Transformers 5.14.1
+BatchEncoding return type by extracting `input_ids`. This oracle covers the
+specified Qwen3 text-chat policy; it does not certify every model template.
+
+Run the producer from the repository root with Go 1.27.2. The actual macOS
+producer run reached these services through a task-scoped SSH loopback tunnel,
+using local ports 28480/28481:
+
+```bash
+VLLM_RENDER_TEST_BASELINE_URL=http://127.0.0.1:28480 \
+VLLM_RENDER_TEST_URL=http://127.0.0.1:28481 \
+VLLM_RENDER_TEST_MODEL=router-qwen3-8b \
+VLLM_RENDER_TEST_ALIAS=router-qwen3-8b-alias \
+go test ./pkg/epp/framework/plugins/requestcontrol/dataproducer/tokenizer \
+  -run 'TestTokenizerCacheParityLive|TestNativeRenderLive' -count=1 -json
+```
+
+Stop only the test-owned service PIDs with SIGTERM after verification. Require
+ON `cache_hits > 0`, ON `renderer_cache_instances == 1`, and OFF zero instances
+and hits in the emitted statistics. The deployed services and tunnel were
+stopped after collecting evidence. Timings and hit ratios here describe a
+synthetic correctness sample; no load or generation benchmark was executed.

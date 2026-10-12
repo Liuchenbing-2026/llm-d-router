@@ -425,6 +425,8 @@ Save as `/etc/epp/config.yaml`.  This example uses the default KV-cache
 utilization scorer and random picker -- adapt scheduling plugins as needed.
 
 ```yaml
+apiVersion: llm-d.ai/v1
+kind: EndpointPickerConfig
 plugins:
   - name: file-disc
     type: file-discovery
@@ -440,14 +442,12 @@ plugins:
 
   - name: single-profile
     type: single-profile-handler
-    parameters:
-      scorer: kv-cache-scorer
-      picker: random-picker
 
 schedulingProfiles:
   - name: default
     plugins:
-      - pluginRef: single-profile
+      - pluginRef: kv-cache-scorer
+      - pluginRef: random-picker
 
 dataLayer:
   discovery:
@@ -463,8 +463,13 @@ epp \
   --config-file /etc/epp/config.yaml \
   --grpc-port 9002 \
   --grpc-health-port 9003 \
-  --metrics-port 9090
+  --metrics-port 9090 \
+  --secure-serving=false
 ```
+
+This local-only example uses plaintext gRPC to match the Envoy cluster below.
+For a network deployment, keep secure serving enabled and configure Envoy's
+upstream TLS transport to trust the EPP certificate; see [TLS](tls.md).
 
 `--pool-name` is optional in file discovery mode and defaults to `epp` if
 unset. It is used as the internal pool identifier in the scheduler and

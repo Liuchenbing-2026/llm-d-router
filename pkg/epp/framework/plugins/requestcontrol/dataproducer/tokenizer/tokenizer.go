@@ -86,6 +86,10 @@ type tokenizerPluginConfig struct {
 	// ModelName is used for startup probes, native gRPC text, and legacy Messages.
 	// Native HTTP rendering keeps the effective model, including aliases and adapters.
 	ModelName string `json:"modelName"`
+	// SegmentCache enables the segment-level result cache in front of the
+	// render backend. It is only valid with the vLLM render backend: the
+	// estimate backend is computed in process and has no render to reuse.
+	SegmentCache *segmentCacheConfig `json:"segmentCache,omitempty"`
 }
 
 // estimateConfig configures the estimation backend. Multimodal image, video,
@@ -271,6 +275,15 @@ func PluginFactory(name string, rawParameters *json.Decoder, handle plugin.Handl
 			}
 		}
 	}
+	// The segment cache sits in front of the render backend and needs a render
+	// to cache. The estimate backend runs in process, so the combination is a
+	// configuration error rather than a silently ignored option.
+	if config.SegmentCache != nil && !vllm {
+		return nil, fmt.Errorf("invalid configuration for '%s' plugin: 'segmentCache' requires the vllm render backend", PluginType)
+	}
+	if config.SegmentCache != nil && config.SegmentCache.Size < 0 {
+		return nil, fmt.Errorf("invalid configuration for '%s' plugin: 'segmentCache.size' must not be negative", PluginType)
+	}
 
 	p, err := NewPlugin(handle.Context(), name, &config)
 	if err != nil {
@@ -310,6 +323,19 @@ func NewPlugin(ctx context.Context, name string, config *tokenizerPluginConfig) 
 	default:
 		backend = estimateBackend{img: newImageEstimator(config.Estimate), vid: newVideoEstimator(config.Estimate), aud: newAudioEstimator(config.Estimate)}
 		backendName = backendEstimate
+	}
+
+	// The segment cache wraps the render backend rather than the plugin, so it
+	// sees the same bodies the backend does and stays out of the estimate path.
+	if segCache, err := newSegmentCache(config.SegmentCache, name); err != nil {
+		return nil, fmt.Errorf("failed to initialize the segment cache for '%s' plugin - %w", PluginType, err)
+	} else if segCache != nil {
+		inner := backend
+		backend = &cachingProducer{inner: inner, cache: segCache, pluginName: name}
+		go segCache.startReporter(ctx)
+		if config.SegmentCache.probeEnabled() {
+			go segCache.runProbe(ctx, inner, config.ModelName)
+		}
 	}
 
 	typedName := plugin.TypedName{Type: PluginType, Name: name}
